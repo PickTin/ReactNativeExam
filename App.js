@@ -7,10 +7,11 @@ import { ThemeProvider, useAppTheme } from './ThemeContext';
 import { AuthProvider, useAuth } from './Auth/AuthContext';
 import { initDatabase } from './database/offencesDatabase';
 import AppNavigator from './navigation/AppNavigator';
+import { startAutoSync } from './sync/syncService';
 
 function AppContent() {
     const { theme, colors } = useAppTheme();
-    const { loading: authLoading } = useAuth();
+    const { user, loading: authLoading } = useAuth();
     const [dbReady, setDbReady] = useState(false);
 
     useEffect(() => {
@@ -26,6 +27,11 @@ function AppContent() {
         };
         initialize();
     }, []);
+
+    useEffect(() => {
+        if (!dbReady || !user) return undefined;
+        return startAutoSync(user.id);
+    }, [dbReady, user?.id]);
 
     if (authLoading || !dbReady) {
         return (

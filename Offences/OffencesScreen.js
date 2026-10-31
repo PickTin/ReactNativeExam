@@ -44,7 +44,7 @@ const OffencesScreen = ({ route, navigation }) => {
         const parts = [];
         if (!date) parts.push(item.time ? `${item.date} ${item.time.slice(0, 5)}` : item.date);
         if (user && item.user_id === user.id) {
-            parts.push(item.sync_status === SYNC_STATUS.SYNCED ? 'Synced' : 'Pending sync');
+            parts.push(item.sync_error ? 'Sync failed' : item.sync_status === SYNC_STATUS.SYNCED ? 'Synced' : 'Pending sync');
         }
         return parts.join(' · ');
     };

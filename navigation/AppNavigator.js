@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, StyleSheet, Alert } from 'react-native';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import {
@@ -13,12 +14,15 @@ import AuthScreen from '../Auth/AuthScreen';
 import MapScreen from '../Offences/MapScreen';
 import { useAppTheme } from '../ThemeContext';
 import { useAuth } from '../Auth/AuthContext';
+import { syncAll, describeSyncResult } from '../sync/syncService';
 
 const Drawer = createDrawerNavigator();
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
-const tabIcon = (symbol) => () => <Text style={styles.tabIcon}>{symbol}</Text>;
+const tabIcon = (name) => ({ focused, color, size }) => (
+    <Ionicons name={focused ? name : `${name}-outline`} size={size} color={color} />
+);
 
 function MainTabs() {
     const { colors } = useAppTheme();
@@ -36,11 +40,11 @@ function MainTabs() {
             }}
         >
             <Tab.Screen name="CalendarTab" component={Calendar}
-                        options={{ title: 'Offence Calendar', tabBarIcon: tabIcon('📅') }} />
+                        options={{ title: 'Calendar', tabBarIcon: tabIcon('calendar') }} />
             <Tab.Screen name="OffencesTab" component={OffencesScreen}
-                        options={{ title: 'Offences', tabBarIcon: tabIcon('📋') }} />
+                        options={{ title: 'Offences', tabBarIcon: tabIcon('folder') }} />
             <Tab.Screen name="MapTab" component={MapScreen}
-                        options={{ title: 'Map', tabBarIcon: tabIcon('🗺️') }} />
+                        options={{ title: 'Map', tabBarIcon: tabIcon('map') }} />
         </Tab.Navigator>
     );
 }
@@ -89,6 +93,11 @@ function CustomDrawerContent(props) {
         }
     };
 
+    const handleSync = async () => {
+        const result = await syncAll(user.id);
+        Alert.alert('Sync', describeSyncResult(result));
+    };
+
     return (
         <DrawerContentScrollView {...props}>
             <View style={[styles.drawerHeader, { borderBottomColor: colors.border }]}>
@@ -104,6 +113,9 @@ function CustomDrawerContent(props) {
                     <DrawerItem label="Log In" onPress={() => navigation.navigate('Login')} {...itemProps('Login')} />
                     <DrawerItem label="Sign Up" onPress={() => navigation.navigate('Register')} {...itemProps('Register')} />
                 </>
+            )}
+            {user && (
+                <DrawerItem label="Sync now" onPress={handleSync} inactiveTintColor={colors.text} />
             )}
             {user && (
                 <DrawerItem label="Log Out" onPress={handleLogout} inactiveTintColor={colors.danger} />
@@ -138,7 +150,6 @@ export default function AppNavigator() {
 }
 
 const styles = StyleSheet.create({
-    tabIcon: { fontSize: 20 },
     drawerHeader: { padding: 16, marginBottom: 8, borderBottomWidth: 1 },
     drawerTitle: { fontSize: 18, fontWeight: '700', marginBottom: 4 },
 });

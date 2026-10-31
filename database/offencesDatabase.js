@@ -9,6 +9,7 @@ export const SYNC_STATUS = {
     PENDING_DELETE: 'pending_delete',
 };
 
+// Each entry is applied once; the applied count is stored in PRAGMA user_version.
 const MIGRATIONS = [
     `
     CREATE TABLE IF NOT EXISTS offences (
@@ -30,10 +31,12 @@ const MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_offences_sync ON offences(sync_status);
     `,
     `ALTER TABLE offences ADD COLUMN time TEXT;`,
+    `ALTER TABLE offences ADD COLUMN sync_error TEXT;`,
 ];
 
-const LIST_COLUMNS = `id, server_id, description, image_url, date, time, user_id,
-    latitude, longitude, sync_status, created_at, updated_at`;
+// List queries skip the BLOB column to keep memory usage low.
+const LIST_COLUMNS = `id, client_uuid, server_id, description, image_url, date, time, user_id,
+    latitude, longitude, sync_status, sync_error, created_at, updated_at`;
 
 let dbPromise = null;
 
@@ -132,17 +135,20 @@ export const insertOffence = async ({
     );
 };
 
-export const updateOffence = async (id, userId, { description, date }) => {
+// A synced record becomes pending_update; a record that was never sent stays pending_create.
+export const updateOffence = async (id, userId, { description, date, latitude = null, longitude = null }) => {
     const db = await getDb();
     return await db.runAsync(
         `UPDATE offences
-         SET description = ?, date = ?, updated_at = ?,
+         SET description = ?, date = ?, latitude = ?, longitude = ?, updated_at = ?, sync_error = NULL,
              sync_status = CASE WHEN sync_status = 'synced' THEN 'pending_update' ELSE sync_status END
-         WHERE id = ? AND user_id = ?`,
-        [description, date, new Date().toISOString(), id, String(userId)]
+         WHERE id = ? AND user_id = ? AND sync_status != 'pending_delete'`,
+        [description, date, latitude, longitude, new Date().toISOString(), id, String(userId)]
     );
 };
 
+// A record the server has never seen is deleted at once; a synced one is only marked
+// pending_delete so that the deletion can be sent to the server later.
 export const deleteOffence = async (id, userId) => {
     const db = await getDb();
     await db.runAsync(
@@ -164,22 +170,112 @@ export const buildOffencePayload = (offence) => ({
     latitude: offence.latitude,
     longitude: offence.longitude,
     created_at: offence.created_at,
+    url: offence.image_url,
 });
 
+// Sync queue: every record of the user that is not synced yet.
 export const fetchPendingOffences = async (userId) => {
     const db = await getDb();
     return await db.getAllAsync(
-        'SELECT * FROM offences WHERE user_id = ? AND sync_status != ? ORDER BY id',
+        `SELECT ${LIST_COLUMNS}, (image IS NOT NULL) AS has_image FROM offences
+         WHERE user_id = ? AND sync_status != ? ORDER BY id`,
         [String(userId), SYNC_STATUS.SYNCED]
     );
 };
 
-export const markOffenceSynced = async (id, { serverId, imageUrl = null }) => {
+export const fetchOffenceImage = async (id) => {
+    const db = await getDb();
+    const row = await db.getFirstAsync('SELECT image FROM offences WHERE id = ?', [id]);
+    return row?.image ?? null;
+};
+
+// Remembers the Cloudinary URL right after upload so a retry never uploads the photo twice.
+export const setOffenceImageUrl = async (id, imageUrl) => {
+    const db = await getDb();
+    return await db.runAsync('UPDATE offences SET image_url = ? WHERE id = ?', [imageUrl, id]);
+};
+
+// Marks a record as synced only if it was not edited while the request was in flight;
+// otherwise it stays in the queue as pending_update.
+export const markOffenceSynced = async (id, { serverId, imageUrl = null, expectedUpdatedAt }) => {
     const db = await getDb();
     return await db.runAsync(
         `UPDATE offences
-         SET server_id = ?, image_url = COALESCE(?, image_url), sync_status = ?
+         SET server_id = ?, image_url = COALESCE(?, image_url), sync_error = NULL,
+             sync_status = CASE WHEN updated_at = ? THEN 'synced' ELSE 'pending_update' END
          WHERE id = ?`,
-        [serverId, imageUrl, SYNC_STATUS.SYNCED, id]
+        [serverId, imageUrl, expectedUpdatedAt, id]
+    );
+};
+
+export const markOffenceSyncError = async (id, message) => {
+    const db = await getDb();
+    return await db.runAsync('UPDATE offences SET sync_error = ? WHERE id = ?', [message, id]);
+};
+
+// Pull sync: merges the server's list into SQLite.
+// Local records with pending changes are never overwritten; synced records that no longer
+// exist on the server are removed.
+export const applyRemoteOffences = async (remoteList) => {
+    const db = await getDb();
+    await db.withTransactionAsync(async () => {
+        const remoteIds = new Set();
+        for (const remote of remoteList) {
+            remoteIds.add(remote.id);
+
+            const byServerId = await db.getFirstAsync(
+                'SELECT id, sync_status FROM offences WHERE server_id = ?',
+                [remote.id]
+            );
+            if (byServerId) {
+                if (byServerId.sync_status === SYNC_STATUS.SYNCED) {
+                    await db.runAsync(
+                        `UPDATE offences
+                         SET description = ?, image_url = COALESCE(?, image_url), date = ?, time = ?,
+                             latitude = ?, longitude = ?, user_id = ?, created_at = ?, updated_at = ?
+                         WHERE id = ?`,
+                        [remote.description, remote.url ?? null, remote.date, remote.time ?? null,
+                         remote.latitude ?? null, remote.longitude ?? null, String(remote.user_id),
+                         remote.created_at, remote.updated_at, byServerId.id]
+                    );
+                }
+                continue;
+            }
+
+            const byUuid = await db.getFirstAsync(
+                'SELECT id FROM offences WHERE client_uuid = ?',
+                [remote.client_uuid]
+            );
+            if (byUuid) continue;
+
+            await db.runAsync(
+                `INSERT INTO offences
+                    (client_uuid, server_id, description, image, image_url, date, time, user_id,
+                     latitude, longitude, sync_status, created_at, updated_at)
+                 VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [remote.client_uuid, remote.id, remote.description, remote.url ?? null, remote.date,
+                 remote.time ?? null, String(remote.user_id), remote.latitude ?? null,
+                 remote.longitude ?? null, SYNC_STATUS.SYNCED, remote.created_at, remote.updated_at]
+            );
+        }
+
+        const synced = await db.getAllAsync(
+            'SELECT id, server_id FROM offences WHERE sync_status = ? AND server_id IS NOT NULL',
+            [SYNC_STATUS.SYNCED]
+        );
+        for (const row of synced) {
+            if (!remoteIds.has(row.server_id)) {
+                await db.runAsync('DELETE FROM offences WHERE id = ?', [row.id]);
+            }
+        }
+    });
+};
+
+// Removes a record after its deletion has been confirmed by the server.
+export const purgeOffence = async (id) => {
+    const db = await getDb();
+    return await db.runAsync(
+        'DELETE FROM offences WHERE id = ? AND sync_status = ?',
+        [id, SYNC_STATUS.PENDING_DELETE]
     );
 };

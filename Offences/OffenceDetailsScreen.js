@@ -1,3 +1,4 @@
+import * as FileSystem from 'expo-file-system/legacy';
 import { useEffect, useRef, useState } from 'react';
 import {
     View, Text, TextInput, StyleSheet, Pressable, Alert, ScrollView, Image, Modal,
@@ -6,19 +7,23 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Location from 'expo-location';
 import {
     fetchOffence, insertOffence, updateOffence, deleteOffence, toDateString, toTimeString,
-    buildOffencePayload,
 } from '../database/offencesDatabase';
+import { runSync } from '../sync/syncService';
+import { bytesToBase64 } from '../utils/imageUtils';
 import { useAppTheme } from '../ThemeContext';
 import { useAuth } from '../Auth/AuthContext';
+import LocationPickerModal from '../LocationPickerModal';
 
-const bytesToBase64 = (bytes) => {
-    let binary = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-    }
-    return btoa(binary);
-};
+const LOCATION_TIMEOUT_MS = 10000;
+
+// Rejects if the promise does not settle in time (GPS can hang with a weak signal).
+const withTimeout = (promise, ms) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Location request timed out.')), ms);
+    promise.then(
+        (value) => { clearTimeout(timer); resolve(value); },
+        (error) => { clearTimeout(timer); reject(error); }
+    );
+});
 
 const OffenceDetailsScreen = ({ route, navigation }) => {
     const { offenceId, date } = route.params;
@@ -31,10 +36,12 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
     const [location, setLocation] = useState(null);
     const [locationStatus, setLocationStatus] = useState('idle');
     const [cameraOpen, setCameraOpen] = useState(false);
+    const [pickerOpen, setPickerOpen] = useState(false);
     const [taking, setTaking] = useState(false);
     const [saving, setSaving] = useState(false);
     const [loading, setLoading] = useState(!!offenceId);
     const cameraRef = useRef(null);
+    const manualLocationRef = useRef(false);
     const [permission, requestPermission] = useCameraPermissions();
     const { colors } = useAppTheme();
     const { user } = useAuth();
@@ -60,7 +67,6 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
                     setOwnerId(offence.user_id);
                     if (offence.latitude != null && offence.longitude != null) {
                         setLocation({ latitude: offence.latitude, longitude: offence.longitude });
-                        setLocationStatus('ready');
                     }
                     if (offence.image_url) {
                         setPhotoUri(offence.image_url);
@@ -78,35 +84,60 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
         loadOffence();
     }, [offenceId]);
 
-    const fetchLocation = async () => {
+    // Location is optional: failures never block the form. With silent = true no alerts are shown.
+    const fetchLocation = async (silent = false) => {
         setLocationStatus('loading');
         try {
             const { status } = await Location.requestForegroundPermissionsAsync();
             if (status !== 'granted') {
-                setLocationStatus('error');
-                Alert.alert('Permission required', 'Location permission is needed to record where the offence happened.');
+                setLocationStatus('unavailable');
+                if (!silent) {
+                    Alert.alert('Permission denied', 'Location permission was denied. You can still choose the location on the map.');
+                }
                 return;
             }
-            const position = await Location.getCurrentPositionAsync({
-                accuracy: Location.Accuracy.Balanced,
-            });
-            setLocation({
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-            });
+            const position = await withTimeout(
+                Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+                LOCATION_TIMEOUT_MS
+            );
+            if (silent && manualLocationRef.current) {
+                setLocationStatus('ready');
+                return;
+            }
+            manualLocationRef.current = false;
+            setLocation({ latitude: position.coords.latitude, longitude: position.coords.longitude });
             setLocationStatus('ready');
         } catch (error) {
             console.error('Error getting location:', error);
-            setLocationStatus('error');
-            Alert.alert('Error', 'Could not get your location. Make sure location services are enabled.');
+            setLocationStatus('unavailable');
+            if (!silent) {
+                Alert.alert('Location unavailable', 'Could not get your location. Check that location services are enabled, or choose the location on the map.');
+            }
         }
+    };
+
+    useEffect(() => {
+        if (isNew && canEdit) fetchLocation(true);
+    }, [isNew, canEdit]);
+
+    const confirmPickedLocation = (coordinate) => {
+        manualLocationRef.current = true;
+        setLocation({ latitude: coordinate.latitude, longitude: coordinate.longitude });
+        setLocationStatus('ready');
+        setPickerOpen(false);
+    };
+
+    const clearLocation = () => {
+        manualLocationRef.current = true;
+        setLocation(null);
+        setLocationStatus('idle');
     };
 
     const openCamera = async () => {
         if (!permission?.granted) {
             const result = await requestPermission();
             if (!result.granted) {
-                Alert.alert('Permission required', 'Camera permission is needed to photograph an offence.');
+                Alert.alert('Permission required', 'Camera permission is needed to take a photo. You can save the offence without a photo.');
                 return;
             }
         }
@@ -118,12 +149,8 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
         setTaking(true);
         try {
             const picture = await cameraRef.current.takePictureAsync({ quality: 0.5 });
-            const now = new Date();
-            setLocation(null);
             setPhotoUri(picture.uri);
-            setOffenceTime(toTimeString(now));
             setCameraOpen(false);
-            fetchLocation();
         } catch (error) {
             console.error('Error taking photo:', error);
             Alert.alert('Error', 'Failed to take a photo.');
@@ -134,16 +161,8 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
 
     const saveOffence = async () => {
         if (!canEdit || saving) return;
-        if (isNew && !photoUri) {
-            Alert.alert('Warning', 'Take a photo of the offence first.');
-            return;
-        }
         if (!description.trim()) {
             Alert.alert('Warning', 'Please enter an offence description.');
-            return;
-        }
-        if (isNew && !location) {
-            Alert.alert('Warning', 'Location is not available yet. Tap "Update location" and try again.');
             return;
         }
         if (isNew && offenceDate > toDateString()) {
@@ -152,23 +171,39 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
         }
         setSaving(true);
         try {
+            const latitude = location ? location.latitude : null;
+            const longitude = location ? location.longitude : null;
             if (isNew) {
-                const response = await fetch(photoUri);
-                const buffer = await response.arrayBuffer();
-                const result = await insertOffence({
+                let image = null;
+                if (photoUri) {
+                    const base64 = await FileSystem.readAsStringAsync(photoUri, {
+                        encoding: FileSystem.EncodingType.Base64,
+                    });
+                    const binary = atob(base64);
+                    image = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) {
+                        image[i] = binary.charCodeAt(i);
+                    }
+                }
+                await insertOffence({
                     description: description.trim(),
                     date: offenceDate,
-                    time: offenceTime,
+                    time: toTimeString(),
                     userId: user.id,
-                    latitude: location.latitude,
-                    longitude: location.longitude,
-                    image: new Uint8Array(buffer),
+                    latitude,
+                    longitude,
+                    image,
                 });
-                const saved = await fetchOffence(result.lastInsertRowId);
-                console.log('Prepared POST payload:', JSON.stringify(buildOffencePayload(saved)));
             } else {
-                await updateOffence(offenceId, user.id, { description: description.trim(), date: offenceDate });
+                await updateOffence(offenceId, user.id, {
+                    description: description.trim(),
+                    date: offenceDate,
+                    latitude,
+                    longitude,
+                });
             }
+            const syncResult = await runSync(user.id);
+            console.log('[SYNC DIAGNOSTICS]', JSON.stringify(syncResult));
             navigation.goBack();
         } catch (error) {
             console.error('Error saving offence:', error);
@@ -187,6 +222,7 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
                 onPress: async () => {
                     try {
                         await deleteOffence(offenceId, user.id);
+                        runSync(user.id);
                         navigation.goBack();
                     } catch (error) {
                         console.error('Error deleting offence:', error);
@@ -205,14 +241,14 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
         );
     }
 
-    const locationText = {
-        idle: 'Location: will be detected after the photo is taken',
-        loading: 'Location: detecting...',
-        error: 'Location: unavailable',
-        ready: location
-            ? `Location: ${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`
-            : 'Location: unavailable',
-    }[locationStatus];
+    let locationText = 'Location: not set';
+    if (location) {
+        locationText = `Location: ${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`;
+    } else if (locationStatus === 'loading') {
+        locationText = 'Location: detecting...';
+    } else if (locationStatus === 'unavailable') {
+        locationText = 'Location: not set (GPS unavailable)';
+    }
 
     return (
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
@@ -224,26 +260,48 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
                 <Image source={{ uri: photoUri }} style={styles.photo} resizeMode="cover" />
             ) : (
                 <View style={[styles.photo, styles.photoPlaceholder]}>
-                    <Text style={styles.meta}>No photo yet</Text>
+                    <Text style={styles.meta}>{isNew ? 'No photo (optional)' : 'No photo'}</Text>
                 </View>
             )}
 
             {isNew && canEdit && (
-                <Pressable style={styles.secondaryButton} onPress={openCamera}>
-                    <Text style={styles.secondaryButtonText}>{photoUri ? 'Retake photo' : 'Take photo'}</Text>
-                </Pressable>
+                <View style={styles.row}>
+                    <Pressable style={styles.chip} onPress={openCamera}>
+                        <Text style={styles.chipText}>{photoUri ? 'Retake photo' : 'Take photo'}</Text>
+                    </Pressable>
+                    {photoUri && (
+                        <Pressable style={styles.chip} onPress={() => setPhotoUri(null)}>
+                            <Text style={styles.chipText}>Remove photo</Text>
+                        </Pressable>
+                    )}
+                </View>
             )}
 
             <Text style={styles.meta}>{`Offence date: ${offenceDate ?? '-'}`}</Text>
             <Text style={styles.meta}>
-                {offenceTime ? `Offence time: ${offenceTime.slice(0, 5)}` : 'Offence time: recorded when the photo is taken'}
+                {offenceTime ? `Offence time: ${offenceTime.slice(0, 5)}` : 'Offence time: set automatically when saved'}
             </Text>
             {createdAt && <Text style={styles.meta}>{`Added: ${createdAt}`}</Text>}
+
             <Text style={styles.meta}>{locationText}</Text>
-            {isNew && canEdit && photoUri && locationStatus !== 'loading' && (
-                <Pressable style={styles.linkButton} onPress={fetchLocation}>
-                    <Text style={styles.linkText}>Update location</Text>
-                </Pressable>
+            {canEdit && (
+                <View style={styles.row}>
+                    <Pressable
+                        style={[styles.chip, locationStatus === 'loading' && styles.disabled]}
+                        onPress={() => fetchLocation(false)}
+                        disabled={locationStatus === 'loading'}
+                    >
+                        <Text style={styles.chipText}>Use my location</Text>
+                    </Pressable>
+                    <Pressable style={styles.chip} onPress={() => setPickerOpen(true)}>
+                        <Text style={styles.chipText}>Choose on map</Text>
+                    </Pressable>
+                    {location && (
+                        <Pressable style={styles.chip} onPress={clearLocation}>
+                            <Text style={styles.chipText}>Clear location</Text>
+                        </Pressable>
+                    )}
+                </View>
             )}
 
             <Text style={styles.label}>Description</Text>
@@ -281,6 +339,13 @@ const OffenceDetailsScreen = ({ route, navigation }) => {
                     </View>
                 </View>
             </Modal>
+
+            <LocationPickerModal
+                visible={pickerOpen}
+                initialLocation={location}
+                onConfirm={confirmPickedLocation}
+                onCancel={() => setPickerOpen(false)}
+            />
         </ScrollView>
     );
 };
@@ -298,6 +363,18 @@ const makeStyles = (colors) => StyleSheet.create({
         backgroundColor: colors.surface,
     },
     meta: { fontSize: 15, marginBottom: 8, color: colors.secondaryText },
+    row: { flexDirection: 'row', flexWrap: 'wrap', marginBottom: 12 },
+    chip: {
+        borderWidth: 1,
+        borderColor: colors.border,
+        backgroundColor: colors.card,
+        borderRadius: 10,
+        paddingVertical: 9,
+        paddingHorizontal: 14,
+        marginRight: 8,
+        marginBottom: 8,
+    },
+    chipText: { color: colors.text, fontWeight: '600' },
     label: { fontSize: 16, fontWeight: 'bold', marginTop: 12, marginBottom: 8, color: colors.text },
     input: {
         backgroundColor: colors.input,
@@ -310,18 +387,6 @@ const makeStyles = (colors) => StyleSheet.create({
         color: colors.text,
     },
     description: { minHeight: 120 },
-    secondaryButton: {
-        borderWidth: 1,
-        borderColor: colors.border,
-        backgroundColor: colors.card,
-        padding: 12,
-        borderRadius: 10,
-        alignItems: 'center',
-        marginBottom: 16,
-    },
-    secondaryButtonText: { color: colors.text, fontWeight: '600' },
-    linkButton: { alignSelf: 'flex-start', marginBottom: 4 },
-    linkText: { color: colors.primary, fontWeight: '600' },
     saveButton: {
         backgroundColor: colors.button,
         padding: 14,
