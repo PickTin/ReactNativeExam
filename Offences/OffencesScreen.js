@@ -42,7 +42,7 @@ const OffencesScreen = ({ route, navigation }) => {
 
     const buildMeta = (item) => {
         const parts = [];
-        if (!date) parts.push(item.date);
+        if (!date) parts.push(item.time ? `${item.date} ${item.time.slice(0, 5)}` : item.date);
         if (user && item.user_id === user.id) {
             parts.push(item.sync_status === SYNC_STATUS.SYNCED ? 'Synced' : 'Pending sync');
         }

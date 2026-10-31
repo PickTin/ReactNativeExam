@@ -12,7 +12,6 @@ const Calendar = ({ navigation }) => {
     const { colors } = useAppTheme();
     const styles = makeStyles(colors);
 
-    // Оновлюємо крапки щоразу, коли вкладка знову стає активною
     useFocusEffect(useCallback(() => {
         const loadOffenceDates = async () => {
             try {

@@ -29,7 +29,7 @@ const Header = ({ currentDate, setCurrentDate }) => {
                 </Pressable>
             </View>
             <Pressable style={styles.todayButton} onPress={today}>
-                <Text style={styles.todayText}>Сьогодні</Text>
+                <Text style={styles.todayText}>Today</Text>
             </Pressable>
         </View>
     );

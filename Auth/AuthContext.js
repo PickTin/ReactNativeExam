@@ -37,7 +37,7 @@ export function AuthProvider({ children }) {
             throw new Error('Enter correct email.');
         }
         if (password.length < 6) {
-            throw new Error('Password must be at least 6 characters:');
+            throw new Error('Password must be at least 6 characters.');
         }
 
         const stored = await AsyncStorage.getItem(STORAGE_KEYS.LOCAL_USERS);

@@ -10,6 +10,7 @@ import Calendar from '../calendar/Calendar';
 import OffencesScreen from '../Offences/OffencesScreen';
 import OffenceDetailsScreen from '../Offences/OffenceDetailsScreen';
 import AuthScreen from '../Auth/AuthScreen';
+import MapScreen from '../Offences/MapScreen';
 import { useAppTheme } from '../ThemeContext';
 import { useAuth } from '../Auth/AuthContext';
 
@@ -17,19 +18,8 @@ const Drawer = createDrawerNavigator();
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
-// Тимчасова заглушка: карта буде реалізована на окремому етапі
-function MapPlaceholder() {
-    const { colors } = useAppTheme();
-    return (
-        <View style={[styles.center, { backgroundColor: colors.background }]}>
-            <Text style={{ color: colors.secondaryText }}>Карта правопорушень з’явиться на наступному етапі.</Text>
-        </View>
-    );
-}
-
 const tabIcon = (symbol) => () => <Text style={styles.tabIcon}>{symbol}</Text>;
 
-// Tab Navigator: основні екрани. Кнопка "гамбургер" відкриває Drawer.
 function MainTabs() {
     const { colors } = useAppTheme();
     return (
@@ -46,16 +36,15 @@ function MainTabs() {
             }}
         >
             <Tab.Screen name="CalendarTab" component={Calendar}
-                        options={{ title: 'Calendar', tabBarIcon: tabIcon('📅') }} />
+                        options={{ title: 'Offence Calendar', tabBarIcon: tabIcon('📅') }} />
             <Tab.Screen name="OffencesTab" component={OffencesScreen}
                         options={{ title: 'Offences', tabBarIcon: tabIcon('📋') }} />
-            <Tab.Screen name="MapTab" component={MapPlaceholder}
+            <Tab.Screen name="MapTab" component={MapScreen}
                         options={{ title: 'Map', tabBarIcon: tabIcon('🗺️') }} />
         </Tab.Navigator>
     );
 }
 
-// Stack поверх вкладок: екрани, що відкриваються "зверху" (день у календарі, деталі запису)
 function MainStack() {
     const { colors } = useAppTheme();
     return (
@@ -77,7 +66,6 @@ function MainStack() {
     );
 }
 
-// Вміст Drawer залежить від режиму: гість бачить "Вхід" і "Реєстрація", користувач — "Вийти"
 function CustomDrawerContent(props) {
     const { navigation, state } = props;
     const { colors, theme, toggleTheme } = useAppTheme();
@@ -129,7 +117,6 @@ function CustomDrawerContent(props) {
     );
 }
 
-// Кореневий навігатор: Drawer → (Головна = Stack → Tabs) + Вхід + Реєстрація
 export default function AppNavigator() {
     const { colors } = useAppTheme();
     return (
@@ -151,7 +138,6 @@ export default function AppNavigator() {
 }
 
 const styles = StyleSheet.create({
-    center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
     tabIcon: { fontSize: 20 },
     drawerHeader: { padding: 16, marginBottom: 8, borderBottomWidth: 1 },
     drawerTitle: { fontSize: 18, fontWeight: '700', marginBottom: 4 },
